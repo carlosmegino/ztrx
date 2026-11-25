@@ -14,6 +14,65 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 const S_ENDPGM: u32 = 0xBF81_0000;
 
+#[test]
+fn permlane_wave64_reads_each_row_with_full_exec() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok(mut validator) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    else {
+        eprintln!("no DXIL validator; not run");
+        return;
+    };
+    for (opcode, cross_row) in [(0xD777_0002, false), (0xD778_0002, true)] {
+        let native = native(&[
+            opcode,
+            0x0004_0100, // permlane v2, v0, s0, s1
+            0x3414_0082, // v_lshlrev_b32 v10, 2, v0
+            0x38 << 26 | 0x1C << 18 | 1 << 12,
+            0x8002_020A, // buffer_store_dword v2, v10, s[8:11], 0 offen
+        ]);
+        let p = ir::build(&native.code, true, native.vgprs).expect("IR");
+        let mut shader = lowered(&native, &p, &HashSet::new()).expect("permlane lowering");
+        validator.validate(&mut shader.dxil).expect("DXIL validation");
+        let (root, pso) = host.compute_pipeline(&shader).expect("permlane pipeline");
+        for selector in [0x0123_4567_89AB_CDEFu64, 0x88AA_CC00_FF33_5599] {
+            let mut ud = vec![0; shader.user_data_dwords().max(2) as usize];
+            for u in &shader.user_data {
+                if u.root == RootType::Constants && u.slot == 0 && u.dword < 2 {
+                    ud[u.index as usize] = (selector >> (32 * u.dword)) as u32;
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(64)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("permlane dispatch");
+            let expected: Vec<u32> = (0..64)
+                .map(|lane| {
+                    let row = (lane & !15) ^ if cross_row { 16 } else { 0 };
+                    let pick = (selector >> (4 * (lane & 15))) as u32 & 15;
+                    row | pick
+                })
+                .collect();
+            assert_eq!(out[0], expected, "cross_row={cross_row}, selector={selector:#x}");
+        }
+    }
+    eprintln!("validated and read back 64 lanes in all four full-EXEC permlane dispatches");
+}
+
 /// 64 threads in one console wave. Each thread t holds the bit `1 << (t >> 1)`; the threads
 /// below s0 (a root constant) OR theirs over the wave inside `if (t < s0) { ... }` and store
 /// the result to dword 0 of the raw UAV.
