@@ -454,19 +454,24 @@ pub(crate) fn device_removed() -> Option<String> {
 pub(crate) static PLACED_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Bytes per element of a buffer view, as the console's descriptor holds
-/// them for indexed reads (structured: the stride; raw: 1, the index is the
-/// byte; typed: the format's); `None` if `view` is not a buffer view.
-fn view_stride(view: &View) -> Option<u32> {
+/// Saved buffer view description and whether it uses the UAV layout.
+fn buffer_view_words(view: &View) -> Option<(&[u32; 10], bool)> {
     const BUFFER: u32 = 1;
-    let (words, unordered): (&[u32; 10], bool) = match view {
+    Some(match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
         View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
         View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
             (d[..10].try_into().ok()?, *unordered)
         }
         _ => return None,
-    };
+    })
+}
+
+/// Bytes per element of a buffer view, as the console's descriptor holds
+/// them for indexed reads (structured: the stride; raw: 1, the index is the
+/// byte; typed: the format's); `None` if `view` is not a buffer view.
+fn view_stride(view: &View) -> Option<u32> {
+    let (words, unordered) = buffer_view_words(view)?;
     // SAFETY: buffer views' union members.
     let (stride, raw, format) = unsafe {
         if unordered {
@@ -1082,21 +1087,21 @@ impl HostHeap {
             // The title's own descriptor words, for programs that read one
             // as numbers: the buffer's address, its record count, and its
             // format and type. Zeros for anything that is not a buffer view.
-            let address = view.and_then(buffer_range).map_or(0, |(a, _)| a);
-            let words = match view {
-                Some(View::Shader(_, Some(d))) => Some(*d),
-                Some(View::Unordered(_, _, Some(d))) => Some(*d),
-                Some(View::Placed(_, resource, d)) if resource[0] == 1 => {
-                    d[..10].try_into().ok()
-                }
-                _ => None,
-            };
-            let table = [
-                address as u32,
-                (address >> 32) as u32,
-                words.map_or(0, |w| w[2]),
-                words.map_or(0, |w| w[3]),
-            ];
+            let table = view
+                .and_then(|view| {
+                    let (words, unordered) = buffer_view_words(view)?;
+                    let (address, _) = buffer_range(view)?;
+                    // SAFETY: buffer_view_words selects only buffer descriptions.
+                    let count = unsafe {
+                        if unordered {
+                            uav_desc(words).Anonymous.Buffer.NumElements
+                        } else {
+                            srv_desc(words).Anonymous.Buffer.NumElements
+                        }
+                    };
+                    Some([address as u32, (address >> 32) as u32, count, words[3]])
+                })
+                .unwrap_or([0; 4]);
             // SAFETY: inside the mapping, four dwords a slot; shaders read
             // it while we write (either value is one the slot had).
             unsafe {
@@ -2273,6 +2278,60 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Use synthetic placed views to exercise the mapped descriptor table.
+    #[test]
+    fn srv_record_count_is_not_component_mapping() {
+        if host().is_none() {
+            return;
+        }
+        let heap = HostHeap::new(false, 4).expect("D3D12 host heap required");
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        resource[4] = 1024;
+        let mut desc = [0u32; 16];
+        desc[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+        desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        desc[6] = 37;
+        desc[7] = 16;
+        desc[10] = 0x10_0000;
+        let parsed = srv_desc(desc[..10].try_into().unwrap());
+        // SAFETY: the description above selects the Buffer union member.
+        assert_eq!(unsafe { parsed.Anonymous.Buffer.NumElements }, 37);
+        heap.note_buffer(0, Some(&View::Placed(false, resource, desc)), false);
+        let data = heap.words.as_ref().expect("descriptor words upload table").2;
+        // SAFETY: slot zero of the live, mapped four-dword-per-slot table.
+        let table = unsafe { (data as *const [u32; 4]).read_unaligned() };
+        assert_eq!(table[2], 37, "descriptor record count must be NumElements");
+        heap.note_buffer(0, None, false);
+        // SAFETY: the same mapped slot, now cleared.
+        assert_eq!(unsafe { (data as *const [u32; 4]).read_unaligned() }, [0; 4]);
+    }
+
+    #[test]
+    fn uav_record_count_is_not_first_element() {
+        if host().is_none() {
+            return;
+        }
+        let heap = HostHeap::new(false, 4).expect("D3D12 host heap required");
+        let mut resource = [0u32; 14];
+        resource[0] = 1;
+        resource[4] = 1024;
+        let mut desc = [0u32; 16];
+        desc[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
+        desc[2] = 5;
+        desc[4] = 37;
+        desc[5] = 16;
+        desc[10] = 0x10_0000;
+        let parsed = uav_desc(desc[..10].try_into().unwrap());
+        // SAFETY: the description above selects the Buffer union member.
+        assert_eq!(unsafe { parsed.Anonymous.Buffer.NumElements }, 37);
+        heap.note_buffer(0, Some(&View::Placed(true, resource, desc)), false);
+        let data = heap.words.as_ref().expect("descriptor words upload table").2;
+        // SAFETY: slot zero of the live, mapped four-dword-per-slot table.
+        let table = unsafe { (data as *const [u32; 4]).read_unaligned() };
+        assert_eq!(table[2], 37, "descriptor record count must be NumElements");
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
