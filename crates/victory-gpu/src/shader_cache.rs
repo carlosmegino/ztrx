@@ -64,6 +64,7 @@ fn build() -> &'static [u8; 32] {
                     "VICTORY_WAVE_WIDE",
                     "VICTORY_WAVE_DEEP_SKIPS",
                     "VICTORY_WAVE_OWN_BITS",
+                    "VICTORY_LDS_FLAGS",
                     "VICTORY_F16_NEAREST",
                 ] {
                     bytes.extend_from_slice(name.as_bytes());
@@ -357,6 +358,48 @@ mod tests {
                 shift: 5,
             }],
         }
+    }
+
+    #[test]
+    fn lds_flag_mode_is_in_the_build_identity() {
+        const CHILD: &str = "VICTORY_TEST_LDS_CACHE_CHILD";
+        const PREFIX: &str = "CACHE_BUILD_KEY=";
+        if std::env::var_os(CHILD).is_some() {
+            println!("{PREFIX}{:?}", build());
+            return;
+        }
+        // Isolated processes exercise the real OnceLock and environment without
+        // mutating the environment of other tests running in this process.
+        let key = |disabled: bool| {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "shader_cache::tests::lds_flag_mode_is_in_the_build_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("VICTORY_LDS_FLAGS");
+            if disabled {
+                command.env("VICTORY_LDS_FLAGS", "0");
+            }
+            let output = command.output().expect("cache-key test child");
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            stdout
+                .split_once(PREFIX)
+                .expect("child printed its build key")
+                .1
+                .lines()
+                .next()
+                .unwrap()
+                .to_owned()
+        };
+        let enabled = key(false);
+        let disabled = key(true);
+        assert_ne!(enabled, disabled, "LDS modes must not reuse translations");
+        assert_eq!(enabled, key(false), "same settings keep the build identity");
+        assert_eq!(disabled, key(true), "same settings keep the build identity");
     }
 
     #[test]
