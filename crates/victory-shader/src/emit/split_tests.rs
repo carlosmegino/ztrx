@@ -440,9 +440,7 @@ fn program_lds(body: &[u32], threads: u32) -> crate::NativeProgram {
 /// of the other half wrote one instruction earlier. Lane t writes t to
 /// dword t, then reads dword 63 - t; then writes that plus 50 to dword t
 /// and reads dword t ^ 32.
-#[test]
-fn one_wave_shares_lds_in_instruction_order() {
-    let body = [
+const LDS_ORDER: &[u32] = &[
         0x4C0A_00BF, // v_sub_nc_u32 v5, 63, v0
         0x3408_0082, // v_lshlrev_b32 v4, 2, v0
         0x340C_0A82, // v_lshlrev_b32 v6, 2, v5
@@ -457,14 +455,88 @@ fn one_wave_shares_lds_in_instruction_order() {
         0x3410_1082, // v_lshlrev_b32 v8, 2, v8
         0xD8D8_0000,
         0x0200_0008, // ds_read_b32 v2, v8
-    ];
+];
+
+#[test]
+fn one_wave_shares_lds_in_instruction_order() {
     // Dword u holds (63 - u) + 50 after the second write.
     program_case(
         "LDS in instruction order",
-        &program_lds(&body, 64),
+        &program_lds(LDS_ORDER, 64),
         |t| (63 - (t ^ 32)) + 50,
         true,
     );
+}
+
+#[test]
+#[ignore = "GPU-timestamp microbenchmark"]
+fn single_wave_lds_timing() {
+    let host = Host::new(false).expect("hardware D3D12 adapter");
+    let target = host.target();
+    assert!(target.runs(32) && !target.runs(64), "expected a 32-lane host");
+    let wave64 = program_lds(LDS_ORDER, 64);
+
+    // Equivalent reference for a native wave32 program. Barriers close
+    // the write-to-read and read-to-write dependencies across its two waves.
+    const BARRIER: u32 = 0xBF8A_0000;
+    let mut explicit = Vec::new();
+    for (i, word) in LDS_ORDER.iter().copied().enumerate() {
+        if [5, 8, 12].contains(&i) {
+            explicit.push(BARRIER);
+        }
+        explicit.push(word);
+    }
+    let mut wave32 = program_lds(&explicit, 64);
+    wave32.wave64 = false;
+    let mut validator =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+            .expect("DXIL validator");
+    let pipelines = [wave32, wave64].map(|native| {
+        let mut shader = emit_for(&native, target).expect("translate");
+        validator.validate(&mut shader.dxil).expect("DXIL");
+        let (root, pso) = host.compute_pipeline(&shader).expect("PSO");
+        let data = vec![0; (shader.user_data_dwords() as usize).max(1)];
+        (root, pso, data)
+    });
+    let groups = 2048;
+    let views = [View::RawUav(64 * groups)];
+    let expected = |i: usize| (63 - ((i as u32 % 64) ^ 32)) + 50;
+    let mut observations = [Vec::new(), Vec::new()];
+    for round in 0..15 {
+        for i in [round % 2, 1 - round % 2] {
+            let (root, pso, data) = &pipelines[i];
+            let (out, ns) = host
+                .dispatch_timed(
+                    root,
+                    pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(data.clone()))],
+                        views: &views,
+                        samplers: &[],
+                        groups: [groups, 1, 1],
+                    },
+                )
+                .expect("dispatch and readback");
+            assert_eq!(out[0].len(), (64 * groups) as usize);
+            for (lane, &value) in out[0].iter().enumerate() {
+                assert_eq!(value, expected(lane), "arm {i}, output {lane}");
+            }
+            if round >= 3 {
+                observations[i].push(ns / 1000.0);
+            }
+        }
+    }
+    for (name, mut us) in ["explicit_wave32", "emulated_wave64"]
+        .into_iter()
+        .zip(observations)
+    {
+        us.sort_by(f64::total_cmp);
+        let median = (us[5] + us[6]) / 2.0;
+        eprintln!(
+            "{name}: {groups} groups, 12 samples, median={median:.2} us, range={:.2}..{:.2} us",
+            us[0], us[11]
+        );
+    }
 }
 
 /// The same sharing with the halves pulled apart: only the lower half does
