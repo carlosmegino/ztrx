@@ -1340,10 +1340,10 @@ fn f64_arith_and_conversions_validate_and_match_ieee() {
 }
 
 #[test]
-fn f64_wave_reduction_executes_on_gpu() {
+fn f64_wave_reduction_reaches_every_lane_on_gpu() {
     // 64 threads (one console wave64 lowered for wave32 hosts): threads with v0 < s0
     // contribute (v0 + 1) as f64; whole-wave DPP/permlane/readlane/v_add_f64 sum
-    // folds to waveActiveOp.f64 + cross-half exchange, then v_cvt_f32_f64 -> UAV[0].
+    // folds to waveActiveOp.f64 + cross-half exchange. Each lane publishes its own result.
     let mut words = vec![
         s_mov_b32(5, 0x80),
     ];
@@ -1388,9 +1388,11 @@ fn f64_wave_reduction_executes_on_gpu() {
         0xBE8D_0307,              // s_mov_b32 s13, s7
         0xBEFE_0404,              // s_mov_b64 exec, s[4:5]
         0xBEFE_041E,              // s_mov_b64 exec, s[30:31]
-        vop1(0x00F, 0, sgpr(12)), // v_cvt_f32_f64 v0, s[12:13]
+        vop1(0x00F, 10, sgpr(12)), // v_cvt_f32_f64 v10, s[12:13]
+        0x3416_0082,              // v_lshlrev_b32 v11, 2, v0
+        0x38 << 26 | 0x1C << 18 | 1 << 12,
+        0x8002_0A0B, // buffer_store_dword v10, v11, s[8:11], 0 offen
     ]);
-    words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
@@ -1475,7 +1477,7 @@ fn f64_wave_reduction_executes_on_gpu() {
         eprintln!("hardware device refused wave64-as-32 f64 reduction pipeline; not run");
         return;
     };
-    for cutoff in [1u32, 17, 32, 40, 64] {
+    for cutoff in [1u32, 17, 31, 32, 33, 40, 63, 64] {
         let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
         for u in &shader.user_data {
             if let (RootType::Constants, 0, 0) = (u.root, u.slot, u.dword) {
@@ -1488,14 +1490,17 @@ fn f64_wave_reduction_executes_on_gpu() {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
-                    views: &[View::RawUav(1)],
+                    views: &[View::RawUav(64)],
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
             )
             .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
         let want = ((cutoff * (cutoff + 1)) / 2) as f32;
-        let got = f32::from_bits(out[0][0]);
-        assert_eq!(got, want, "cutoff {cutoff}: got {got}, want {want}");
+        assert_eq!(out[0].len(), 64);
+        for (lane, &bits) in out[0].iter().enumerate() {
+            assert_eq!(bits, want.to_bits(), "cutoff {cutoff}, lane {lane}");
+        }
     }
+    eprintln!("validated 64 distinct output slots at eight EXEC cutoffs");
 }
