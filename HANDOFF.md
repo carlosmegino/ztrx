@@ -6,6 +6,12 @@ observations from local shader and runtime replays are summarized in
 captures stay outside the public repository. Project code follows the
 repository license and upstream attribution is preserved in Git.
 
+## Public discussion
+
+- [Scalar SRV correction against the console-flow branch](https://github.com/r4tedx/VIctory/pull/18).
+- [128-thread limitation and single-wave64 microbenchmark](https://github.com/Marvisak/VIctory/issues/2688).
+- [NumElements and PR #30, #36, #49 and #54 validation with the original authors mentioned](https://github.com/carlosmegino/ztrx/commit/9a259b03879fab4f6ae96c3c91fbb46db9fdd528#commitcomment-211847345).
+
 ## Independent contributions
 
 Each commit adds one original contribution. Its parent identifies the exact
@@ -44,6 +50,11 @@ system when the test supports adapter selection.
 | `fix/structured-scalar-loads` | `cargo test -p victory-shader --release --locked --lib scalar_buffer_load_crosses_structured_elements -- --nocapture` |
 | `test/permlane-pr49` | `cargo test -p victory-shader --release --locked --lib permlane_wave64_reads_each_row_with_full_exec -- --nocapture` |
 | `test/f64-pr54` | `cargo test -p victory-shader --release --locked --lib f64_wave_reduction_reaches_every_lane_on_gpu -- --nocapture` |
+
+The [diagnostics-only input helper](https://github.com/carlosmegino/ztrx/tree/test/runtime-input)
+is separate from the compute changes. Its branch includes the focused input
+tests and usage notes. The [frame profiling branch](https://github.com/carlosmegino/ztrx/tree/perf/frame-profiling)
+contains the existing cadence tests and benchmark tooling.
 
 ## Remaining work
 
