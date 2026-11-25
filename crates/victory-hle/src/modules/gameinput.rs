@@ -8,6 +8,9 @@
 // would trust.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+#[cfg(all(windows, feature = "diagnostics"))]
+mod live;
+
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::ops::Deref;
@@ -1208,20 +1211,7 @@ mod host {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
             let keys = list.split(',').filter_map(|entry| {
                 let (at, key) = entry.split_once(':')?;
-                let vk = match key.trim() {
-                    "Enter" => 0x0D,
-                    "Esc" => 0x1B,
-                    "Tab" => 0x09,
-                    "Back" => 0x08,
-                    "Up" => 0x26,
-                    "Down" => 0x28,
-                    "Left" => 0x25,
-                    "Right" => 0x27,
-                    k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => {
-                        k.as_bytes()[0].to_ascii_uppercase()
-                    }
-                    _ => return None,
-                };
+                let vk = super::live::virtual_key(key)?;
                 Some((
                     Duration::try_from_secs_f64(at.trim().parse().ok()?).ok()?,
                     vk,
@@ -1231,10 +1221,13 @@ mod host {
         });
         let (start, keys) = &*SCRIPT;
         let now = start.elapsed();
-        keys.iter()
+        let mut down: Vec<_> = keys
+            .iter()
             .filter(|&&(at, _)| (at..at + Duration::from_millis(200)).contains(&now))
             .map(|&(_, vk)| vk)
-            .collect()
+            .collect();
+        down.extend(super::live::key());
+        down
     }
 
     /// The foreground window is one of ours (the title's or our fallback).
