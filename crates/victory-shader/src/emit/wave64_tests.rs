@@ -501,6 +501,108 @@ const fn ds(op: u8, vdst: u8, addr: u8, data0: u8) -> [u32; 2] {
 const DS_WRITE_B32: u8 = 0x0D;
 const DS_READ_B32: u8 = 0x36;
 
+/// Give every lane its own output dword; also exercise flags raised only
+/// by the upper host wave, rather than only by lanes below a threshold.
+fn flag_output_program(second: Option<u32>, upper: bool) -> NativeProgram {
+    let mut native = flag_program(second);
+    let mut words: Vec<u32> = native
+        .code
+        .chunks_exact(4)
+        .map(|w| u32::from_le_bytes(w.try_into().unwrap()))
+        .collect();
+    if upper {
+        let compare = words.iter_mut().find(|w| **w == 0x7D88_0000).unwrap();
+        *compare = 0x7D82_0000; // v_cmp_lt_u32 vcc, s0, v0
+    }
+    let store = words.len() - 3;
+    assert_eq!(words[store], 0x38 << 26 | 0x1C << 18);
+    assert_eq!(words[store + 1], 0x8002_0500);
+    words[store] |= 1 << 12; // buffer_store_dword with offen
+    words[store + 1] |= 10; // address v10
+    words.insert(store, 0x3414_0082); // v_lshlrev_b32 v10, 2, v0
+    native.code = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    native
+}
+
+/// The two host waves must publish the same final flag for empty, partial
+/// and full EXEC masks, including the boundary between lanes 31 and 32.
+#[test]
+fn lds_flags_across_host_waves_produce_the_expected_value() {
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok(mut validator) =
+        validator::Validator::load(validator::Validator::default_path().as_deref())
+    else {
+        eprintln!("no DXIL validator; not run");
+        return;
+    };
+    for (second, upper) in [
+        (None, false),
+        (None, true),
+        (Some(1), false),
+        (Some(1), true),
+    ] {
+        let native = flag_output_program(second, upper);
+        let p = crate::spill::build(&native).expect("build");
+        let mut shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+        validator
+            .validate(&mut shader.dxil)
+            .expect("DXIL validation");
+        let (root, pso) = host.compute_pipeline(&shader).expect("flag pipeline");
+        for threshold in [0, 1, 31, 32, 33, 62, 63, 64] {
+            for skip_read in [0, 1] {
+                for _ in 0..3 {
+                    let mut ud = vec![0; shader.user_data_dwords().max(2) as usize];
+                    ud[0] = threshold;
+                    ud[1] = skip_read;
+                    let out = host
+                        .dispatch(
+                            &root,
+                            &pso,
+                            &Dispatch {
+                                roots: vec![(0, Root::Constants(ud))],
+                                views: &[View::RawUav(64)],
+                                samplers: &[],
+                                groups: [1, 1, 1],
+                            },
+                        )
+                        .expect("flag dispatch");
+                    let raised = if upper {
+                        threshold < 63
+                    } else {
+                        threshold != 0
+                    };
+                    assert_eq!(out[0].len(), 64);
+                    for (lane, &value) in out[0].iter().enumerate() {
+                        assert_eq!(
+                            value,
+                            u32::from(raised),
+                            "second={second:?}, upper={upper}, threshold={threshold}, \
+                             skip_read={skip_read}, lane={lane}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("validated and executed 192 flag dispatches, checking all 64 lanes on hardware");
+}
+
+#[test]
+fn a_flag_region_with_a_live_read_keeps_64_lanes() {
+    let mut native = flag_program(None);
+    let at = native.code.len() - 8;
+    assert_eq!(&native.code[at..at + 4], &0x8002_0500u32.to_le_bytes());
+    // Export the region's v3 read instead of the post-region v5 read.
+    native.code[at..at + 4].copy_from_slice(&0x8002_0300u32.to_le_bytes());
+    assert_eq!(flag_wave(&native), Some(64));
+}
+
 /// The wave size `native` lowers to on a host of 32-lane waves.
 fn flag_wave(native: &NativeProgram) -> Option<u32> {
     let p = crate::spill::build(native).expect("build");
