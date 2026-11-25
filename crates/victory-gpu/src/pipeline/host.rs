@@ -954,6 +954,58 @@ mod tests {
         }
     }
 
+    /// An integer attachment with the title's redundant blend enable must
+    /// reach D3D12 just as the equivalent blend-disabled pipeline does.
+    #[test]
+    fn integer_mesh_target_accepts_redundant_blending() {
+        let Some(host) = host() else {
+            eprintln!("no host GPU; skipped");
+            return;
+        };
+        if !host.mesh_shaders() {
+            eprintln!("no host mesh shader support; skipped");
+            return;
+        }
+        let Some(dxc) = dxc() else {
+            eprintln!("no PC dxc.exe; skipped");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let ms = compile(&dxc, dir.path(), MS, "ms_6_5");
+        let ps = compile(
+            &dxc,
+            dir.path(),
+            "uint main() : SV_Target { return 1u; }",
+            "ps_6_5",
+        );
+        let (root, root_blob) = root_signature(&host.device, &[], &[], false).unwrap();
+        for independent in [false, true] {
+            for enabled in [false, true] {
+                let mut g = GraphicsState::default();
+                g.depth.DepthEnable = false.into();
+                g.targets.NumRenderTargets = 1;
+                g.targets.RTFormats[0] = DXGI_FORMAT_R8_UINT;
+                g.blend.IndependentBlendEnable = independent.into();
+                g.blend.RenderTarget[0].BlendEnable = enabled.into();
+                let name = super::super::library::name(
+                    "integer mesh blend test",
+                    &root_blob,
+                    &[&ms, &ps],
+                    &g.describe(),
+                );
+                mesh_pipeline(&host.device, &root, code(&ms), code(&ps), &g, &name)
+                    .unwrap_or_else(|e| {
+                        panic!(
+                            "integer mesh target: independent={independent}, blend={enabled}: {e}"
+                        )
+                    });
+                eprintln!(
+                    "integer mesh pipeline created: independent={independent}, blend={enabled}"
+                );
+            }
+        }
+    }
+
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
     #[test]
